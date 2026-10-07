@@ -66,6 +66,8 @@
                 background: var(--panel); border: 1px solid var(--line); color: var(--text); }
   .matrix div.c { background: var(--accent); border-color: var(--accent); color: #fff; }
   .matrix div.x { opacity: .35; }
+  .matrix div.tog { cursor: pointer; min-width: 48px; height: 48px; font-size: 18px; }
+  .matrix div.tog.x { opacity: 1; }
   .credit { font-size: 13px; } .credit a { color: var(--muted); }
 </style>
 </head>
@@ -364,6 +366,8 @@ const METRICS = {
   wind:    { label: 'Wind →',         tip: '[4 3 2]\n[5 0 1]\n[4 3 2]',
              full: [[-1, -1, 4], [0, -1, 3], [1, -1, 2], [-1, 0, 5], [1, 0, 1], [-1, 1, 4], [0, 1, 3], [1, 1, 2]], div: 2,
              note: 'Not symmetric: a step right costs 1, a step left costs 5. Ripples lean into the wind.' },
+  custom:  { label: 'Custom 3×3',     tip: 'Click cells on or off', custom: true,
+             note: 'Click cells to switch them. Each step, a pixel stays on only if every on-cell sees foreground (sum ÷ count = 1). Switch the centre off and shapes can drift.' },
 };
 
 // Distance with an arbitrary (possibly asymmetric) 8-neighbour cost table:
@@ -416,16 +420,75 @@ function chamfer(bin, w, h, mask, div) {
 }
 
 let skel = { key: null };
+// Binarize on redness (R minus the larger of G, B): picks out berries, lips, red objects.
+function binarize(src, w, h, t) {
+  const n = w * h, red = new Float32Array(n);
+  for (let i = 0, j = 0; i < n; i++, j += 4) red[i] = Math.max(0, src[j] - Math.max(src[j + 1], src[j + 2]));
+  const g = gauss(red, w, h, 1.5), level = 5 + t * 170;
+  const bin = new Uint8Array(n);
+  for (let y = 1; y < h - 1; y++)
+    for (let x = 1; x < w - 1; x++) bin[y * w + x] = g[y * w + x] > level ? 1 : 0;
+  return bin;
+}
+
+// One erosion step with a 3x3 on/off element, normalised: a pixel is on next step only if
+// (sum of foreground under the "on" cells) / (number of on cells) = 1. With the centre off,
+// a pixel can switch on from its neighbours, so shapes can drift instead of only shrinking.
+function erodeStep(cur, next, w, h, se) {
+  const offs = [];
+  for (let k = 0; k < 9; k++) if (se[k]) offs.push((Math.floor(k / 3) - 1) * w + (k % 3) - 1);
+  let changed = 0;
+  next.fill(0);
+  for (let y = 1; y < h - 1; y++) {
+    for (let x = 1; x < w - 1; x++) {
+      const i = y * w + x;
+      let sum = 0;
+      for (const o of offs) sum += cur[i + o];
+      next[i] = sum / offs.length === 1 ? 1 : 0;
+      if (next[i] !== cur[i]) changed++;
+    }
+  }
+  return changed;
+}
+
+let ero = { key: null };
+function erosionFx(src, out, w, h, t, info) {
+  const n = w * h, key = `${info.frame}|${t}|${w}x${h}|${state.se.join('')}`;
+  if (ero.key !== key) {
+    const bin = binarize(src, w, h, t);
+    ero = { key, bin, cur: bin.slice(), next: new Uint8Array(n), died: new Int16Array(n).fill(-1), step: 0, done: false };
+  }
+  const E = ero, now = performance.now();
+  const steps = info.live ? 30 : now - (E.last || 0) > 90 ? 1 : 0;
+  if (steps) E.last = now;
+  for (let k = 0; !E.done && k < steps; k++) {
+    if (!state.se.some(Boolean) || !erodeStep(E.cur, E.next, w, h, state.se) || E.step >= 200) { E.done = true; break; }
+    E.step++;
+    for (let i = 0; i < n; i++) {
+      if (E.cur[i] && !E.next[i]) E.died[i] = E.step;
+      else if (E.next[i]) E.died[i] = -1;
+    }
+    [E.cur, E.next] = [E.next, E.cur];
+  }
+  // Alive pixels are white; each pixel that switched off is coloured by the step it happened at.
+  for (let i = 0, j = 0; i < n; i++, j += 4) {
+    let r = 0, g = 0, b = 0;
+    if (E.cur[i]) r = g = b = 240;
+    else if (E.died[i] > 0) {
+      const c = TURBO[Math.min(255, Math.round(255 * E.died[i] / Math.max(8, E.step)))];
+      const k = 0.35 + 0.65 * (0.5 + 0.5 * Math.cos(E.died[i] * 0.9));
+      r = c[0] * k; g = c[1] * k; b = c[2] * k;
+    }
+    out[j] = r; out[j + 1] = g; out[j + 2] = b; out[j + 3] = 255;
+  }
+  return { more: !info.live, label: `Erosion · step ${E.step}${E.done ? ' · stopped' : ''}` };
+}
+
 function skeletonFx(src, out, w, h, t, info) {
+  if (METRICS[state.metric].custom) return erosionFx(src, out, w, h, t, info);
   const n = w * h, key = `${info.frame}|${t}|${w}x${h}|${state.metric}`;
   if (skel.key !== key) {
-    // Binarize on redness (R minus the larger of G, B): picks out berries, lips, red objects.
-    const red = new Float32Array(n);
-    for (let i = 0, j = 0; i < n; i++, j += 4) red[i] = Math.max(0, src[j] - Math.max(src[j + 1], src[j + 2]));
-    const g = gauss(red, w, h, 1.5), level = 5 + t * 170;
-    const bin = new Uint8Array(n);
-    for (let y = 1; y < h - 1; y++)
-      for (let x = 1; x < w - 1; x++) bin[y * w + x] = g[y * w + x] > level ? 1 : 0;
+    const bin = binarize(src, w, h, t);
     const M = METRICS[state.metric];
     const dist = M.full ? asymDist(bin, w, h, M.full, M.div) : M.mask ? chamfer(bin, w, h, M.mask, M.div) : edt(bin, w, h);
     let max = 1;
@@ -470,7 +533,7 @@ const srcCv = document.getElementById('src'), fxCv = document.getElementById('fx
 const sctx = srcCv.getContext('2d', { willReadFrequently: true }), fctx = fxCv.getContext('2d');
 const knob = document.getElementById('knob'), stage = document.getElementById('stage');
 const divider = document.getElementById('divider'), fpsTag = document.getElementById('fps');
-const state = { frame: 0, metric: 'euclid', fx: 'skeleton', split: 0.5, source: null, video: null, dirty: true, knobs: {} };
+const state = { frame: 0, metric: 'euclid', se: [0, 1, 0, 1, 1, 1, 0, 1, 0], fx: 'skeleton', split: 0.5, source: null, video: null, dirty: true, knobs: {} };
 
 const bar = document.getElementById('effects');
 for (const [key, e] of Object.entries(EFFECTS)) {
@@ -496,6 +559,13 @@ mbar.children[0].classList.add('on');
 
 // Show the full neighbourhood matrix (forward half + its mirror) for the chosen metric.
 function showMatrix() {
+  const mx = document.getElementById('matrix');
+  if (METRICS[state.metric].custom) {
+    mx.style.gridTemplateColumns = 'repeat(3, auto)';
+    mx.innerHTML = state.se.map((v, k) => `<div class="tog ${v ? 'c' : 'x'}" data-k="${k}">${v}</div>`).join('');
+    document.getElementById('matrixnote').textContent = METRICS.custom.note;
+    return;
+  }
   const M = METRICS[state.metric], list = M.full ?? M.mask;
   const r = list ? Math.max(...list.flat().filter((_, i) => i % 3 < 2).map(Math.abs)) : 1;
   const size = 2 * r + 1, cells = [];
@@ -512,12 +582,18 @@ function showMatrix() {
       cells.push(`<div class="${cls}">${v}</div>`);
     }
   }
-  const mx = document.getElementById('matrix');
   mx.style.gridTemplateColumns = `repeat(${size}, auto)`;
   mx.innerHTML = cells.join('');
   document.getElementById('matrixnote').textContent = M.note ??
     (M.div > 1 ? `Step costs from the centre pixel, divided by ${M.div}.` : 'Step cost from the centre pixel. · = not a neighbour.');
 }
+document.getElementById('matrix').addEventListener('click', e => {
+  const k = e.target.dataset.k;
+  if (k === undefined) return;
+  state.se[k] = state.se[k] ? 0 : 1;
+  showMatrix();
+  state.dirty = true;
+});
 showMatrix();
 
 function selectFx(key) {
