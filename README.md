@@ -1,8 +1,8 @@
 # Toyon
 
-Classical computer vision, live in your browser. Nothing is uploaded.
+Binary topological transform, live in your browser. Nothing is uploaded.
 
-Binary topological transform (binarize, distance map with Euclidean / city-block / chessboard / chamfer metrics, iterative thinning to a skeleton), plus edges, Canny, Harris corners, thermal, threshold and pixelate. Works on the default photo, your own image, or your webcam.
+Binarize an image, then repeatedly apply a custom 3×3 on/off element until nothing changes. Each step a pixel stays on only if every on-cell sees foreground. Turn the centre off and shapes drift instead of shrinking. Works on the default photo, your own image, or your webcam.
 
 Plain HTML + JavaScript, no libraries.
 
