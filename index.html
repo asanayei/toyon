@@ -98,6 +98,7 @@ const EFFECTS = {
   pixel:   { label: 'Pixelate', knob: 'Block',     run: pixelFx },
   emboss:  { label: 'Emboss',   knob: 'Depth',     run: embossFx },
   blur:    { label: 'Blur',     knob: 'Radius',    run: blurFx },
+  skeleton:{ label: 'Skeleton', knob: 'Threshold', run: skeletonFx },
 };
 
 function toGray(src, w, h) {
@@ -317,13 +318,117 @@ function blurFx(src, out, w, h, t) {
   }
 }
 
+// ---------- skeleton: binarize -> Euclidean distance map -> iterative thinning ----------
+// Exact squared Euclidean distance transform (Felzenszwalb & Huttenlocher), 1D pass.
+function dt1d(f, n, d, v, z) {
+  let k = 0; v[0] = 0; z[0] = -Infinity; z[1] = Infinity;
+  for (let q = 1; q < n; q++) {
+    let s;
+    while (true) {
+      s = ((f[q] + q * q) - (f[v[k]] + v[k] * v[k])) / (2 * q - 2 * v[k]);
+      if (s <= z[k]) k--; else break;
+    }
+    k++; v[k] = q; z[k] = s; z[k + 1] = Infinity;
+  }
+  k = 0;
+  for (let q = 0; q < n; q++) {
+    while (z[k + 1] < q) k++;
+    d[q] = (q - v[k]) * (q - v[k]) + f[v[k]];
+  }
+}
+
+// Distance from each foreground pixel to the nearest background pixel.
+function edt(bin, w, h) {
+  const INF = 1e12, n = Math.max(w, h), out = new Float32Array(w * h);
+  const f = new Float64Array(n), d = new Float64Array(n), v = new Int32Array(n), z = new Float64Array(n + 1);
+  for (let i = 0; i < w * h; i++) out[i] = bin[i] ? INF : 0;
+  for (let x = 0; x < w; x++) {
+    for (let y = 0; y < h; y++) f[y] = out[y * w + x];
+    dt1d(f, h, d, v, z);
+    for (let y = 0; y < h; y++) out[y * w + x] = d[y];
+  }
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) f[x] = out[y * w + x];
+    dt1d(f, w, d, v, z);
+    for (let x = 0; x < w; x++) out[y * w + x] = Math.sqrt(d[x]);
+  }
+  return out;
+}
+
+// One Zhang-Suen thinning sub-iteration. Returns how many pixels were removed.
+function thinPass(img, w, h, pass) {
+  const del = [];
+  for (let y = 1; y < h - 1; y++) {
+    for (let x = 1; x < w - 1; x++) {
+      const i = y * w + x;
+      if (!img[i]) continue;
+      const p2 = img[i - w], p3 = img[i - w + 1], p4 = img[i + 1], p5 = img[i + w + 1];
+      const p6 = img[i + w], p7 = img[i + w - 1], p8 = img[i - 1], p9 = img[i - w - 1];
+      const B = p2 + p3 + p4 + p5 + p6 + p7 + p8 + p9;
+      if (B < 2 || B > 6) continue;
+      const A = (!p2 && p3) + (!p3 && p4) + (!p4 && p5) + (!p5 && p6) +
+                (!p6 && p7) + (!p7 && p8) + (!p8 && p9) + (!p9 && p2);
+      if (A !== 1) continue;
+      if (pass === 0 ? (p2 * p4 * p6 || p4 * p6 * p8) : (p2 * p4 * p8 || p2 * p6 * p8)) continue;
+      del.push(i);
+    }
+  }
+  for (const i of del) img[i] = 0;
+  return del.length;
+}
+
+let skel = { key: null };
+function skeletonFx(src, out, w, h, t, info) {
+  const n = w * h, key = `${info.frame}|${t}|${w}x${h}`;
+  if (skel.key !== key) {
+    // Binarize on redness (R minus the larger of G, B): picks out berries, lips, red objects.
+    const red = new Float32Array(n);
+    for (let i = 0, j = 0; i < n; i++, j += 4) red[i] = Math.max(0, src[j] - Math.max(src[j + 1], src[j + 2]));
+    const g = gauss(red, w, h, 1.5), level = 5 + t * 170;
+    const bin = new Uint8Array(n);
+    for (let y = 1; y < h - 1; y++)
+      for (let x = 1; x < w - 1; x++) bin[y * w + x] = g[y * w + x] > level ? 1 : 0;
+    const dist = edt(bin, w, h);
+    let max = 1;
+    for (let i = 0; i < n; i++) if (dist[i] > max) max = dist[i];
+    skel = { key, bin, dist, max, cur: bin.slice(), step: 0, done: false };
+  }
+  // Images animate one thinning step per frame; live video jumps straight to the result.
+  const S = skel, now = performance.now();
+  const steps = info.live ? 1e9 : now - (S.last || 0) > 120 ? 1 : 0;
+  if (steps) S.last = now;
+  for (let k = 0; !S.done && k < steps; k++) {
+    const removed = thinPass(S.cur, w, h, 0) + thinPass(S.cur, w, h, 1);
+    if (removed) S.step++; else S.done = true;
+  }
+  for (let i = 0, j = 0; i < n; i++, j += 4) {
+    let r = 0, g = 0, b = 0;
+    if (S.bin[i]) {
+      const c = TURBO[Math.min(255, Math.round(255 * S.dist[i] / S.max))];
+      const k = S.cur[i] && !S.done ? 1 : 0.35;
+      r = c[0] * k; g = c[1] * k; b = c[2] * k;
+    }
+    out[j] = r; out[j + 1] = g; out[j + 2] = b; out[j + 3] = 255;
+  }
+  if (S.done) {
+    // Draw the skeleton 2px wide so it shows at screen size.
+    for (let i = w; i < n - w; i++) {
+      if (!S.cur[i]) continue;
+      for (const q of [i, i + 1, i + w, i + w + 1]) {
+        const j = q * 4; out[j] = out[j + 1] = out[j + 2] = 255;
+      }
+    }
+  }
+  return { more: !S.done, label: S.done ? `Skeleton · ${S.step} steps` : `Thinning · step ${S.step}` };
+}
+
 // ---------- app ----------
 const MAX_W = 720;
 const srcCv = document.getElementById('src'), fxCv = document.getElementById('fx');
 const sctx = srcCv.getContext('2d', { willReadFrequently: true }), fctx = fxCv.getContext('2d');
 const knob = document.getElementById('knob'), stage = document.getElementById('stage');
 const divider = document.getElementById('divider'), fpsTag = document.getElementById('fps');
-const state = { fx: 'edges', split: 0.5, source: null, video: null, dirty: true, knobs: {} };
+const state = { frame: 0, fx: 'edges', split: 0.5, source: null, video: null, dirty: true, knobs: {} };
 
 const bar = document.getElementById('effects');
 for (const [key, e] of Object.entries(EFFECTS)) {
@@ -354,6 +459,7 @@ function useImage(img) {
   state.source = img;
   setSize(img.naturalWidth, img.naturalHeight);
   sctx.drawImage(img, 0, 0, srcCv.width, srcCv.height);
+  state.frame++;
   state.dirty = true;
 }
 
@@ -409,13 +515,18 @@ stage.addEventListener('pointerup', () => { dragging = false; });
 let last = performance.now(), frames = 0;
 function render() {
   const w = srcCv.width, h = srcCv.height;
-  if (state.video) { sctx.drawImage(state.video, 0, 0, w, h); state.dirty = true; }
+  if (state.video) { sctx.drawImage(state.video, 0, 0, w, h); state.frame++; state.dirty = true; }
   if (state.dirty && w) {
     state.dirty = false;
     const src = sctx.getImageData(0, 0, w, h);
     const out = fctx.createImageData(w, h);
-    const pts = EFFECTS[state.fx].run(src.data, out.data, w, h, knob.value / 100);
+    const res = EFFECTS[state.fx].run(src.data, out.data, w, h, knob.value / 100,
+                                      { frame: state.frame, live: !!state.video });
     fctx.putImageData(out, 0, 0);
+    const fxname = document.getElementById('fxname');
+    fxname.textContent = res?.label ?? EFFECTS[state.fx].label;
+    if (res?.more) state.dirty = true;
+    const pts = Array.isArray(res) ? res : null;
     if (pts) {
       fctx.fillStyle = '#ffd400'; fctx.strokeStyle = '#000'; fctx.lineWidth = 1.5;
       for (const [x, y] of pts) { fctx.beginPath(); fctx.arc(x, y, 4, 0, 7); fctx.fill(); fctx.stroke(); }
@@ -431,7 +542,7 @@ function render() {
 }
 
 setSplit(stage.getBoundingClientRect().left + stage.getBoundingClientRect().width / 2);
-selectFx('edges');
+selectFx(EFFECTS[location.hash.slice(1)] ? location.hash.slice(1) : 'edges');
 const img = new Image();
 img.onload = () => useImage(img);
 img.src = 'toyon.jpg';
