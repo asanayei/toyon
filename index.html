@@ -360,7 +360,34 @@ const METRICS = {
   ch34:    { label: 'Chamfer 3-4',    tip: '[4 3 4]\n[3 0 3]\n[4 3 4]', mask: [[-1, 0, 3], [0, -1, 3], [-1, -1, 4], [1, -1, 4]], div: 3 },
   ch5711:  { label: 'Chamfer 5-7-11', tip: '5×5 mask: 5 straight, 7 diagonal, 11 knight move',
              mask: [[-1, 0, 5], [0, -1, 5], [-1, -1, 7], [1, -1, 7], [-2, -1, 11], [2, -1, 11], [-1, -2, 11], [1, -2, 11]], div: 5 },
+  // Asymmetric: each of the 8 steps has its own cost, so going right is cheap and left is expensive.
+  wind:    { label: 'Wind →',         tip: '[4 3 2]\n[5 0 1]\n[4 3 2]',
+             full: [[-1, -1, 4], [0, -1, 3], [1, -1, 2], [-1, 0, 5], [1, 0, 1], [-1, 1, 4], [0, 1, 3], [1, 1, 2]], div: 2,
+             note: 'Not symmetric: a step right costs 1, a step left costs 5. Ripples lean into the wind.' },
 };
+
+// Distance with an arbitrary (possibly asymmetric) 8-neighbour cost table:
+// d[p] = min over steps o of d[p + o] + cost(o). Sweeps both ways until nothing changes.
+function asymDist(bin, w, h, steps, div) {
+  const d = new Float32Array(w * h);
+  for (let i = 0; i < d.length; i++) d[i] = bin[i] ? 1e9 : 0;
+  for (let it = 0, changed = true; changed && it < 60; it++) {
+    changed = false;
+    for (const dir of [1, -1]) {
+      for (let y = dir > 0 ? 1 : h - 2; y > 0 && y < h - 1; y += dir) {
+        for (let x = dir > 0 ? 1 : w - 2; x > 0 && x < w - 1; x += dir) {
+          const i = y * w + x;
+          if (!d[i]) continue;
+          let v = d[i];
+          for (const [dx, dy, c] of steps) { const t = d[i + dy * w + dx] + c; if (t < v) v = t; }
+          if (v < d[i]) { d[i] = v; changed = true; }
+        }
+      }
+    }
+  }
+  for (let i = 0; i < d.length; i++) d[i] /= div;
+  return d;
+}
 
 // Two-pass chamfer distance transform with the given mask.
 function chamfer(bin, w, h, mask, div) {
@@ -400,7 +427,7 @@ function skeletonFx(src, out, w, h, t, info) {
     for (let y = 1; y < h - 1; y++)
       for (let x = 1; x < w - 1; x++) bin[y * w + x] = g[y * w + x] > level ? 1 : 0;
     const M = METRICS[state.metric];
-    const dist = M.mask ? chamfer(bin, w, h, M.mask, M.div) : edt(bin, w, h);
+    const dist = M.full ? asymDist(bin, w, h, M.full, M.div) : M.mask ? chamfer(bin, w, h, M.mask, M.div) : edt(bin, w, h);
     let max = 1;
     for (let i = 0; i < n; i++) if (dist[i] > max) max = dist[i];
     skel = { key, bin, dist, max, cur: bin.slice(), step: 0, done: false };
@@ -469,12 +496,14 @@ mbar.children[0].classList.add('on');
 
 // Show the full neighbourhood matrix (forward half + its mirror) for the chosen metric.
 function showMatrix() {
-  const M = METRICS[state.metric], r = M.mask ? Math.max(...M.mask.flat().filter((_, i) => i % 3 < 2).map(Math.abs)) : 1;
+  const M = METRICS[state.metric], list = M.full ?? M.mask;
+  const r = list ? Math.max(...list.flat().filter((_, i) => i % 3 < 2).map(Math.abs)) : 1;
   const size = 2 * r + 1, cells = [];
   for (let dy = -r; dy <= r; dy++) {
     for (let dx = -r; dx <= r; dx++) {
       let v = '·', cls = 'x';
       if (!dx && !dy) { v = '0'; cls = 'c'; }
+      else if (M.full) { const hit = M.full.find(([mx, my]) => mx === dx && my === dy); if (hit) { v = hit[2]; cls = ''; } }
       else if (!M.mask) { const d = Math.hypot(dx, dy); v = Number.isInteger(d) ? d : d === Math.SQRT2 ? '√2' : d.toFixed(2); cls = ''; }
       else {
         const hit = M.mask.find(([mx, my]) => (mx === dx && my === dy) || (mx === -dx && my === -dy));
