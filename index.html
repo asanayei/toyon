@@ -56,6 +56,10 @@
   .slider span { min-width: 88px; color: var(--muted); }
   .hint { color: var(--muted); font-size: 15px; margin-top: 14px; }
   input[type=file] { display: none; }
+  .metrics { margin-top: -4px; }
+  .metrics::before { content: "Distance"; align-self: center; color: var(--muted); margin-right: 4px; }
+  .metrics button { padding: 6px 12px; font-size: 15px; }
+  .metrics[hidden] { display: none; }
   .credit { font-size: 13px; } .credit a { color: var(--muted); }
 </style>
 </head>
@@ -74,6 +78,7 @@
   </div>
 
   <div class="effects" id="effects"></div>
+  <div class="effects metrics" id="metrics"></div>
 
   <div class="row">
     <div class="slider"><span id="knobname">Strength</span><input id="knob" type="range" min="0" max="100" value="50"></div>
@@ -89,16 +94,13 @@
 // ---------- effects: each has a label, a slider name, and a run(src, out, w, h, t) ----------
 // src/out are RGBA Uint8ClampedArrays; t is the slider value in 0..1.
 const EFFECTS = {
+  skeleton:{ label: 'Binary Topological Transform', knob: 'Threshold', run: skeletonFx },
   edges:   { label: 'Edges',    knob: 'Contrast',  run: edgesFx },
   canny:   { label: 'Canny',    knob: 'Threshold', run: cannyFx },
   corners: { label: 'Corners',  knob: 'Amount',    run: cornersFx },
-  cartoon: { label: 'Cartoon',  knob: 'Colors',    run: cartoonFx },
   thermal: { label: 'Thermal',  knob: 'Gamma',     run: thermalFx },
   thresh:  { label: 'Threshold',knob: 'Level',     run: threshFx },
   pixel:   { label: 'Pixelate', knob: 'Block',     run: pixelFx },
-  emboss:  { label: 'Emboss',   knob: 'Depth',     run: embossFx },
-  blur:    { label: 'Blur',     knob: 'Radius',    run: blurFx },
-  skeleton:{ label: 'Skeleton', knob: 'Threshold', run: skeletonFx },
 };
 
 function toGray(src, w, h) {
@@ -238,20 +240,6 @@ function cornersFx(src, out, w, h, t) {
   return pts;
 }
 
-function cartoonFx(src, out, w, h, t) {
-  const n = w * h, levels = Math.round(2 + t * 8), step = 255 / (levels - 1);
-  const r = new Float32Array(n), g = new Float32Array(n), b = new Float32Array(n);
-  for (let i = 0, j = 0; i < n; i++, j += 4) { r[i] = src[j]; g[i] = src[j + 1]; b[i] = src[j + 2]; }
-  const rb = gauss(r, w, h, 2), gb = gauss(g, w, h, 2), bb = gauss(b, w, h, 2);
-  const { gx, gy } = sobel(gauss(toGray(src, w, h), w, h, 1.2), w, h);
-  for (let i = 0, j = 0; i < n; i++, j += 4) {
-    const ink = Math.hypot(gx[i], gy[i]) > 90 ? 0 : 1;
-    out[j]     = Math.round(rb[i] / step) * step * ink;
-    out[j + 1] = Math.round(gb[i] / step) * step * ink;
-    out[j + 2] = Math.round(bb[i] / step) * step * ink;
-    out[j + 3] = 255;
-  }
-}
 
 // Turbo colormap, polynomial approximation.
 function turbo(x) {
@@ -296,27 +284,7 @@ function pixelFx(src, out, w, h, t) {
   }
 }
 
-function embossFx(src, out, w, h, t) {
-  const g = toGray(src, w, h), k = 0.5 + t * 4, v = new Float32Array(w * h).fill(128);
-  for (let y = 1; y < h - 1; y++)
-    for (let x = 1; x < w - 1; x++) {
-      const i = y * w + x;
-      v[i] = 128 + k * (g[i + w + 1] - g[i - w - 1]);
-    }
-  writeGray(out, v, v.length);
-}
 
-function blurFx(src, out, w, h, t) {
-  const n = w * h, s = 0.5 + t * 12;
-  const ch = [0, 1, 2].map(c => {
-    const a = new Float32Array(n);
-    for (let i = 0; i < n; i++) a[i] = src[i * 4 + c];
-    return gauss(a, w, h, s);
-  });
-  for (let i = 0, j = 0; i < n; i++, j += 4) {
-    out[j] = ch[0][i]; out[j + 1] = ch[1][i]; out[j + 2] = ch[2][i]; out[j + 3] = 255;
-  }
-}
 
 // ---------- skeleton: binarize -> Euclidean distance map -> iterative thinning ----------
 // Exact squared Euclidean distance transform (Felzenszwalb & Huttenlocher), 1D pass.
@@ -377,9 +345,45 @@ function thinPass(img, w, h, pass) {
   return del.length;
 }
 
+// Distance metrics. Chamfer masks list the forward half of the neighbourhood as [dx, dy, weight].
+const METRICS = {
+  euclid:  { label: 'Euclidean',      tip: 'exact √(dx² + dy²)' },
+  city:    { label: 'City block',     tip: '[· 1 ·]\n[1 0 1]\n[· 1 ·]', mask: [[-1, 0, 1], [0, -1, 1]], div: 1 },
+  chess:   { label: 'Chessboard',     tip: '[1 1 1]\n[1 0 1]\n[1 1 1]', mask: [[-1, 0, 1], [0, -1, 1], [-1, -1, 1], [1, -1, 1]], div: 1 },
+  ch34:    { label: 'Chamfer 3-4',    tip: '[4 3 4]\n[3 0 3]\n[4 3 4]', mask: [[-1, 0, 3], [0, -1, 3], [-1, -1, 4], [1, -1, 4]], div: 3 },
+  ch5711:  { label: 'Chamfer 5-7-11', tip: '5×5 mask: 5 straight, 7 diagonal, 11 knight move',
+             mask: [[-1, 0, 5], [0, -1, 5], [-1, -1, 7], [1, -1, 7], [-2, -1, 11], [2, -1, 11], [-1, -2, 11], [1, -2, 11]], div: 5 },
+};
+
+// Two-pass chamfer distance transform with the given mask.
+function chamfer(bin, w, h, mask, div) {
+  const d = new Float32Array(w * h);
+  for (let i = 0; i < d.length; i++) d[i] = bin[i] ? 1e9 : 0;
+  const sweep = (y0, y1, x0, x1, step, sign) => {
+    for (let y = y0; y !== y1; y += step) {
+      for (let x = x0; x !== x1; x += step) {
+        const i = y * w + x;
+        if (!d[i]) continue;
+        let v = d[i];
+        for (const [dx, dy, wt] of mask) {
+          const xx = x + sign * dx, yy = y + sign * dy;
+          if (xx < 0 || xx >= w || yy < 0 || yy >= h) continue;
+          const c = d[yy * w + xx] + wt;
+          if (c < v) v = c;
+        }
+        d[i] = v;
+      }
+    }
+  };
+  sweep(0, h, 0, w, 1, 1);
+  sweep(h - 1, -1, w - 1, -1, -1, -1);
+  for (let i = 0; i < d.length; i++) d[i] /= div;
+  return d;
+}
+
 let skel = { key: null };
 function skeletonFx(src, out, w, h, t, info) {
-  const n = w * h, key = `${info.frame}|${t}|${w}x${h}`;
+  const n = w * h, key = `${info.frame}|${t}|${w}x${h}|${state.metric}`;
   if (skel.key !== key) {
     // Binarize on redness (R minus the larger of G, B): picks out berries, lips, red objects.
     const red = new Float32Array(n);
@@ -388,7 +392,8 @@ function skeletonFx(src, out, w, h, t, info) {
     const bin = new Uint8Array(n);
     for (let y = 1; y < h - 1; y++)
       for (let x = 1; x < w - 1; x++) bin[y * w + x] = g[y * w + x] > level ? 1 : 0;
-    const dist = edt(bin, w, h);
+    const M = METRICS[state.metric];
+    const dist = M.mask ? chamfer(bin, w, h, M.mask, M.div) : edt(bin, w, h);
     let max = 1;
     for (let i = 0; i < n; i++) if (dist[i] > max) max = dist[i];
     skel = { key, bin, dist, max, cur: bin.slice(), step: 0, done: false };
@@ -401,11 +406,14 @@ function skeletonFx(src, out, w, h, t, info) {
     const removed = thinPass(S.cur, w, h, 0) + thinPass(S.cur, w, h, 1);
     if (removed) S.step++; else S.done = true;
   }
+  // Colour by distance, with ripples (iso-distance bands) that travel inward from the edges.
+  const phase = now / 250;
   for (let i = 0, j = 0; i < n; i++, j += 4) {
     let r = 0, g = 0, b = 0;
     if (S.bin[i]) {
       const c = TURBO[Math.min(255, Math.round(255 * S.dist[i] / S.max))];
-      const k = S.cur[i] && !S.done ? 1 : 0.35;
+      const wave = 0.3 + 0.7 * (0.5 + 0.5 * Math.cos(S.dist[i] * 0.7 - phase));
+      const k = (S.cur[i] && !S.done ? 1.15 : 1) * wave;
       r = c[0] * k; g = c[1] * k; b = c[2] * k;
     }
     out[j] = r; out[j + 1] = g; out[j + 2] = b; out[j + 3] = 255;
@@ -419,7 +427,7 @@ function skeletonFx(src, out, w, h, t, info) {
       }
     }
   }
-  return { more: !S.done, label: S.done ? `Skeleton · ${S.step} steps` : `Thinning · step ${S.step}` };
+  return { more: !info.live, label: (S.done ? `Skeleton · ${S.step} steps` : `Thinning · step ${S.step}`) + ` · ${METRICS[state.metric].label}` };
 }
 
 // ---------- app ----------
@@ -428,7 +436,7 @@ const srcCv = document.getElementById('src'), fxCv = document.getElementById('fx
 const sctx = srcCv.getContext('2d', { willReadFrequently: true }), fctx = fxCv.getContext('2d');
 const knob = document.getElementById('knob'), stage = document.getElementById('stage');
 const divider = document.getElementById('divider'), fpsTag = document.getElementById('fps');
-const state = { frame: 0, fx: 'edges', split: 0.5, source: null, video: null, dirty: true, knobs: {} };
+const state = { frame: 0, metric: 'euclid', fx: 'skeleton', split: 0.5, source: null, video: null, dirty: true, knobs: {} };
 
 const bar = document.getElementById('effects');
 for (const [key, e] of Object.entries(EFFECTS)) {
@@ -438,6 +446,19 @@ for (const [key, e] of Object.entries(EFFECTS)) {
   bar.appendChild(b);
 }
 
+const mbar = document.getElementById('metrics');
+for (const [key, m] of Object.entries(METRICS)) {
+  const b = document.createElement('button');
+  b.textContent = m.label; b.title = m.tip; b.dataset.key = key;
+  b.onclick = () => {
+    state.metric = key;
+    for (const c of mbar.children) c.classList.toggle('on', c.dataset.key === key);
+    state.dirty = true;
+  };
+  mbar.appendChild(b);
+}
+mbar.children[0].classList.add('on');
+
 function selectFx(key) {
   state.knobs[state.fx] = knob.value;
   state.fx = key;
@@ -445,6 +466,7 @@ function selectFx(key) {
   document.getElementById('knobname').textContent = EFFECTS[key].knob;
   document.getElementById('fxname').textContent = EFFECTS[key].label;
   for (const b of bar.children) b.classList.toggle('on', b.dataset.key === key);
+  mbar.hidden = key !== 'skeleton';
   state.dirty = true;
 }
 
@@ -542,7 +564,7 @@ function render() {
 }
 
 setSplit(stage.getBoundingClientRect().left + stage.getBoundingClientRect().width / 2);
-selectFx(EFFECTS[location.hash.slice(1)] ? location.hash.slice(1) : 'edges');
+selectFx(EFFECTS[location.hash.slice(1)] ? location.hash.slice(1) : 'skeleton');
 const img = new Image();
 img.onload = () => useImage(img);
 img.src = 'toyon.jpg';
