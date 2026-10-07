@@ -92,6 +92,10 @@
 
   <p class="hint">Click the 3×3 cells to switch them on or off. Each step, a pixel stays on only if every on-cell sees foreground. Runs until nothing changes.</p>
   <p class="hint">Drag the white line to compare. Drop an image anywhere.</p>
+  <div class="row" style="margin: 14px 0 6px">
+    <button id="rotate">⟳ Rotate 90° each step: off</button>
+    <span class="hint">Turns the 3×3 a quarter turn clockwise before every step. Most useful for asymmetric patterns.</span>
+  </div>
   <p class="hint credit">Toyon photo: <a href="https://commons.wikimedia.org/wiki/File:J20151125-0008%E2%80%94Heteromeles_arbutifolia_(23303059776).jpg">John Rusk</a>, <a href="https://creativecommons.org/licenses/by/2.0/">CC BY 2.0</a></p>
 </main>
 
@@ -173,7 +177,7 @@ const srcCv = document.getElementById('src'), fxCv = document.getElementById('fx
 const sctx = srcCv.getContext('2d', { willReadFrequently: true }), fctx = fxCv.getContext('2d');
 const knob = document.getElementById('knob'), stage = document.getElementById('stage');
 const divider = document.getElementById('divider'), status = document.getElementById('status');
-const state = { frame: 0, se: [0, 1, 0, 1, 1, 1, 0, 1, 0], source: null, video: null, dirty: true };
+const state = { frame: 0, rotate: false, se: [0, 1, 0, 1, 1, 1, 0, 1, 0], source: null, video: null, dirty: true };
 let run = { key: null };
 
 const matrix = document.getElementById('matrix');
@@ -236,6 +240,25 @@ document.getElementById('cam').onclick = () => {
   if (state.video) { stopCam(); if (state.source) useImage(state.source); }
   else startCam();
 };
+const rotBtn = document.getElementById('rotate');
+rotBtn.onclick = () => {
+  state.rotate = !state.rotate;
+  rotBtn.textContent = `⟳ Rotate 90° each step: ${state.rotate ? 'on' : 'off'}`;
+  rotBtn.classList.toggle('on', state.rotate);
+  state.dirty = true;
+};
+
+// Quarter turn clockwise, applied q times: cell (row, col) moves to (col, 2 - row).
+function rotated(se, q) {
+  let m = se;
+  for (let k = 0; k < q % 4; k++) {
+    const r = new Array(9);
+    for (let i = 0; i < 9; i++) r[(i % 3) * 3 + 2 - Math.floor(i / 3)] = m[i];
+    m = r;
+  }
+  return m;
+}
+
 document.getElementById('restart').onclick = () => { run.key = null; state.dirty = true; };
 document.getElementById('file').onchange = e => loadFile(e.target.files[0]);
 knob.oninput = () => { state.dirty = true; };
@@ -256,11 +279,11 @@ stage.addEventListener('pointerup', () => { dragging = false; });
 
 // Advance the transform. Images animate one step every 90 ms; webcam frames run up to 40 steps.
 function advance(w, h) {
-  const n = w * h, t = knob.value / 100, key = `${state.frame}|${t}|${w}x${h}|${state.se.join('')}`;
+  const n = w * h, t = knob.value / 100, key = `${state.frame}|${t}|${w}x${h}|${state.se.join('')}|${state.rotate}`;
   if (run.key !== key) {
     const bin = binarize(sctx.getImageData(0, 0, w, h).data, w, h, t);
     run = { key, cur: bin, next: new Uint8Array(n), died: new Int32Array(n).fill(-1),
-            step: 0, done: '', seen: new Map(), last: 0 };
+            step: 0, still: 0, done: '', seen: new Map(), last: 0 };
   }
   const R = run, now = performance.now();
   // Long runs speed up: one step per tick at first, more as the step count grows.
@@ -268,8 +291,13 @@ function advance(w, h) {
   if (budget) R.last = now;
   for (let k = 0; !R.done && k < budget; k++) {
     if (!state.se.some(Boolean)) { R.done = 'no cells on'; break; }
-    const { changed, hash } = step(R.cur, R.next, w, h, state.se);
-    if (!changed) { R.done = 'converged'; break; }
+    // With rotation on, only call it converged once a full turn (4 steps) changes nothing.
+    const q = state.rotate ? R.step % 4 : 0;
+    const { changed, hash } = step(R.cur, R.next, w, h, rotated(state.se, q));
+    if (!changed) {
+      R.still++;
+      if (!state.rotate || R.still >= 4) { R.done = 'converged'; break; }
+    } else R.still = 0;
     R.step++;
     for (let i = 0; i < n; i++) {
       if (R.cur[i] && !R.next[i]) R.died[i] = R.step;
@@ -277,8 +305,9 @@ function advance(w, h) {
     }
     [R.cur, R.next] = [R.next, R.cur];
     // A pattern that repeats will never settle; stop and report the cycle length.
-    if (R.seen.has(hash)) { R.done = `cycle of ${R.step - R.seen.get(hash)}`; break; }
-    R.seen.set(hash, R.step);
+    const id = `${hash}|${state.rotate ? R.step % 4 : 0}`;
+    if (changed && R.seen.has(id)) { R.done = `cycle of ${R.step - R.seen.get(id)}`; break; }
+    R.seen.set(id, R.step);
   }
   return R;
 }
@@ -302,7 +331,7 @@ function render() {
       o[j] = r; o[j + 1] = g; o[j + 2] = b; o[j + 3] = 255;
     }
     fctx.putImageData(out, 0, 0);
-    status.textContent = `Step ${R.step}${R.done ? ' · ' + R.done : ''}`;
+    status.textContent = `Step ${R.step}${state.rotate ? ` · ${(R.step % 4) * 90}°` : ''}${R.done ? ' · ' + R.done : ''}`;
   }
   requestAnimationFrame(render);
 }
