@@ -12,6 +12,8 @@ The berries as a 3D point cloud ([open it](https://asanayei.github.io/toyon/#dep
 - Stored as `depth.png` (16-bit inverse depth in two channels) plus `depth.json`.
 - The browser unprojects all 614k pixels on the GPU with plain WebGL2. Drag to orbit, scroll to zoom.
 - Scan sweeps a glowing sheet through the depth; Peel removes everything in front of it.
+- Wind is depth-aware: a 48×32×10 grid of springs in inverse depth. Gusts reach deeper layers later and weaker, and front twigs are springier. Points move as whole berries over a background built from the farthest nearby content, so nothing stretches or ghosts.
+- Save an 8 s video from the original camera.
 
 Depth Pro is used under Apple's research licence (non-commercial).
 
