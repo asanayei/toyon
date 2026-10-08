@@ -63,13 +63,27 @@
   .hint { color: var(--muted); font-size: 15px; margin: 6px 0; }
   input[type=file] { display: none; }
   .credit { font-size: 13px; } .credit a { color: var(--muted); }
+  .tabs { display: flex; gap: 6px; margin: 0 0 14px; }
+  [hidden] { display: none !important; }
+  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+  .seg button { border: 0; border-radius: 0; }
+  #dstage { cursor: grab; } #dstage:active { cursor: grabbing; }
+  #dstage canvas { aspect-ratio: 3 / 2; }
+  details { color: var(--muted); font-size: 15px; margin: 6px 0; }
+  summary { cursor: pointer; }
 </style>
 </head>
 <body>
 <main>
   <h1>Toyon</h1>
-  <p class="sub">Binary topological transform, live in your browser. Nothing is uploaded.</p>
+  <p class="sub" id="sub">Binary topological transform, live in your browser. Nothing is uploaded.</p>
 
+  <div class="tabs">
+    <button class="on" data-tab="topo">Topology</button>
+    <button data-tab="depth">🔴 Depth 3D</button>
+  </div>
+
+  <section id="tab-topo">
   <div class="stage" id="stage">
     <canvas id="src"></canvas>
     <canvas id="fx"></canvas>
@@ -92,9 +106,36 @@
 
   <p class="hint">Click the 3×3 cells to switch them on or off. Each step, a pixel stays on only if every on-cell sees foreground. Runs until nothing changes.</p>
   <p class="hint">Drag the white line to compare. Drop an image anywhere.</p>
+  </section>
+
+  <section id="tab-depth" hidden>
+  <div class="stage" id="dstage"><canvas id="dcv"></canvas><div class="tag r" id="dstatus">Loading…</div></div>
+  <div class="controls">
+    <div class="side">
+      <div class="slider"><span>Depth</span><input id="zscale" type="range" min="5" max="100" value="20"></div>
+      <div class="slider"><span>Scan</span><input id="scan" type="range" min="0" max="1000" value="0"></div>
+      <div class="row">
+        <div class="seg" id="colors"><button data-color="0" class="on">Photo</button><button data-color="1">Depth colours</button></div>
+        <div class="seg" id="scans"><button data-scan="0">No scan</button><button data-scan="1" class="on">Scan</button><button data-scan="2">Peel</button></div>
+        <button id="dreset">↻ Reset view</button>
+      </div>
+    </div>
+  </div>
+  <p class="hint">Drag to look around. Scroll to zoom. Peel strips away the berries layer by layer, front to back.</p>
+  <details>
+    <summary>How it works</summary>
+    <p>Apple's Depth Pro model estimated how far away every pixel is, and the camera's field of view
+    (about 12°, a zoom lens). That ran once, ahead of time. Your browser turns each of the 614,000 pixels
+    into a point in 3D at its real distance, all on the GPU. At the start you see it from the original
+    camera, so it looks just like the photo, until it turns.</p>
+    <p>Depth by <a href="https://github.com/apple/ml-depth-pro">Depth Pro</a> (Bochkovskii et al., 2024),
+    used under Apple's research licence.</p>
+  </details>
+  </section>
   <p class="hint credit">Toyon photo: <a href="https://commons.wikimedia.org/wiki/File:J20151125-0008%E2%80%94Heteromeles_arbutifolia_(23303059776).jpg">John Rusk</a>, <a href="https://creativecommons.org/licenses/by/2.0/">CC BY 2.0</a></p>
 </main>
 
+<script src="depth.js"></script>
 <script>
 // Separable Gaussian blur on a single channel.
 function gauss(a, w, h, sigma) {
@@ -174,7 +215,7 @@ const sctx = srcCv.getContext('2d', { willReadFrequently: true }), fctx = fxCv.g
 const knob = document.getElementById('knob'), stage = document.getElementById('stage');
 const divider = document.getElementById('divider'), status = document.getElementById('status');
 const state = { frame: 0, se: [0, 1, 0, 1, 1, 1, 0, 1, 0], source: null, video: null, dirty: true };
-let run = { key: null };
+let run = { key: null }, tab = 'topo';
 
 const matrix = document.getElementById('matrix');
 function showMatrix() {
@@ -284,6 +325,7 @@ function advance(w, h) {
 }
 
 function render() {
+  if (tab !== 'topo') { requestAnimationFrame(render); return; }
   const w = srcCv.width, h = srcCv.height;
   if (state.video) { sctx.drawImage(state.video, 0, 0, w, h); state.frame++; state.dirty = true; }
   if (state.dirty && w) {
@@ -307,9 +349,110 @@ function render() {
   requestAnimationFrame(render);
 }
 
+// ---------- tabs ----------
+const SUBS = {
+  topo: 'Binary topological transform, live in your browser. Nothing is uploaded.',
+  depth: 'The berries in 3D: every pixel placed at its real distance from the camera.',
+};
+document.querySelectorAll('[data-tab]').forEach(b => b.onclick = () => {
+  tab = b.dataset.tab;
+  document.querySelectorAll('[data-tab]').forEach(x => x.classList.toggle('on', x === b));
+  for (const t of ['topo', 'depth']) document.getElementById('tab-' + t).hidden = tab !== t;
+  document.getElementById('sub').textContent = SUBS[tab];
+  if (tab === 'depth') { stopCam(); depthStart(); }
+  history.replaceState(null, '', tab === 'topo' ? location.pathname + location.search : '#' + tab);
+});
+
+// ---------- depth 3D ----------
+const dcv = document.getElementById('dcv'), dstage = document.getElementById('dstage');
+const dstatus = document.getElementById('dstatus');
+const dv = { view: null, loading: false, auto: true, t0: 0, yaw: 0, pitch: 0, dist: 0, zoom: 1,
+             color: 0, scanMode: 1, scanAuto: true, scan: 0, meta: null, drag: null, fps: 60, last: 0 };
+
+async function depthStart() {
+  if (dv.view || dv.loading) return;
+  dv.loading = true;
+  try {
+    const load = src => new Promise((ok, bad) => { const i = new Image(); i.onload = () => ok(i); i.onerror = () => bad(new Error('could not load ' + src)); i.src = src; });
+    const [color, depth, meta] = await Promise.all([load('toyon.jpg'), load('depth.png'), fetch('depth.json').then(r => r.json())]);
+    dv.meta = meta;
+    sizeDepthCanvas();
+    dv.view = makeDepthView(dcv, color, depth, meta);
+    resetView();
+  } catch (err) { dstatus.textContent = 'Could not start: ' + err.message; }
+  dv.loading = false;
+}
+function sizeDepthCanvas() {
+  const dpr = Math.min(2, devicePixelRatio || 1), w = Math.round(dstage.clientWidth * dpr);
+  if (w && dcv.width !== w) { dcv.width = w; dcv.height = Math.round(w * 2 / 3); }
+}
+addEventListener('resize', sizeDepthCanvas);
+function pivot() { const m = dv.meta; return Math.sqrt(m.near * m.far); }
+function resetView() { dv.yaw = 0; dv.pitch = 0; dv.dist = pivot(); dv.zoom = 1; dv.auto = true; dv.t0 = performance.now(); }
+document.getElementById('dreset').onclick = resetView;
+
+function segment(id, attr, set) {
+  const el = document.getElementById(id);
+  el.onclick = e => {
+    const v = e.target.dataset[attr];
+    if (v === undefined) return;
+    el.querySelectorAll('button').forEach(b => b.classList.toggle('on', b === e.target));
+    set(+v);
+  };
+}
+segment('colors', 'color', v => { dv.color = v; });
+segment('scans', 'scan', v => { dv.scanMode = v; dv.scanAuto = true; });
+document.getElementById('scan').oninput = e => {
+  dv.scan = e.target.value / 1000; dv.scanAuto = false;
+  if (!dv.scanMode) { dv.scanMode = 1; document.querySelector('[data-scan="1"]').click(); dv.scanAuto = false; }
+};
+
+dstage.addEventListener('pointerdown', e => {
+  dstage.setPointerCapture(e.pointerId);
+  dv.drag = { x: e.clientX, y: e.clientY, yaw: dv.yaw, pitch: dv.pitch };
+  dv.auto = false;
+});
+dstage.addEventListener('pointermove', e => {
+  if (!dv.drag) return;
+  const w = dstage.clientWidth;
+  dv.yaw = dv.drag.yaw - (e.clientX - dv.drag.x) / w * 2.2;
+  dv.pitch = Math.max(-1.2, Math.min(1.2, dv.drag.pitch + (e.clientY - dv.drag.y) / w * 2.2));
+});
+dstage.addEventListener('pointerup', () => { dv.drag = null; });
+dstage.addEventListener('pointercancel', () => { dv.drag = null; });
+dstage.addEventListener('wheel', e => {
+  e.preventDefault();
+  dv.zoom = Math.max(0.4, Math.min(6, dv.zoom * Math.exp(-e.deltaY * 0.0015)));
+}, { passive: false });
+
+function depthLoop(now) {
+  requestAnimationFrame(depthLoop);
+  if (tab !== 'depth' || !dv.view) { dv.last = now; return; }
+  const t = (now - dv.t0) / 1000;
+  // Until you touch it: a slow look left and right, so the depth shows itself.
+  if (dv.auto) { dv.yaw = 0.35 * Math.sin(t * 0.35) * Math.min(1, t / 3); dv.pitch = 0.1 * Math.sin(t * 0.23) * Math.min(1, t / 3); }
+  if (dv.scanMode && dv.scanAuto) {
+    dv.scan = ((t * 0.08) % 1.15) - 0.05;
+    document.getElementById('scan').value = Math.max(0, dv.scan) * 1000;
+  }
+  const zscale = document.getElementById('zscale').value / 100;
+  dv.view.draw({ yaw: dv.yaw, pitch: dv.pitch, dist: dv.dist, zoom: dv.zoom, zscale, zpivot: pivot(),
+                 scan: dv.scan, scanMode: dv.scanMode, colorMode: dv.color });
+  dv.fps = dv.fps * 0.95 + 0.05 * 1000 / Math.max(1, now - dv.last);
+  dv.last = now;
+  const m = dv.meta, z = 1 / (1 / m.near + Math.max(0, Math.min(1, dv.scan)) * (1 / m.far - 1 / m.near));
+  dstatus.textContent = `${(m.w * m.h / 1000).toFixed(0)}k points · ${Math.round(dv.fps)} fps` +
+    (dv.scanMode ? ` · scan at ${z.toFixed(2)} m` : '');
+}
+requestAnimationFrame(depthLoop);
+
 setSplit(stage.getBoundingClientRect().left + stage.getBoundingClientRect().width / 2);
 const img = new Image();
-img.onload = () => useImage(img);
+img.onload = () => {
+  useImage(img);
+  const t = location.hash.slice(1);
+  if (t) document.querySelector(`[data-tab="${t}"]`)?.click();
+};
 img.src = 'toyon.jpg';
 requestAnimationFrame(render);
 </script>
