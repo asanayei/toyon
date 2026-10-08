@@ -10,7 +10,11 @@ uniform sampler2D depthTex, colorTex;
 uniform highp sampler3D windTex;
 uniform mat4 viewProj;
 uniform vec2 size;
-uniform float f, near, far, zscale, zpivot, pxScale, scan, scanMode, colorMode, windOn;
+uniform float f, near, far, zscale, zpivot, pxScale, scan, scanMode, colorMode, windOn, genPass;
+// Generated points (gen.bin) come as vertex attributes instead of from the depth texture.
+in vec2 aPos;     // original-photo pixel position * 8
+in float aQ;      // inverse depth, normalised: q = aQ * 2 - 0.5
+in vec4 aCol;     // rgb + footprint (a * 255 / 32 original pixels)
 out vec3 vColor;
 
 vec3 turbo(float x) {
@@ -23,27 +27,34 @@ vec3 turbo(float x) {
 }
 
 void main() {
-  int W = int(size.x);
-  ivec2 p = ivec2(gl_VertexID % W, gl_VertexID / W);
-  vec4 d = texelFetch(depthTex, p, 0);
-  float q = (floor(d.r * 255.0 + 0.5) * 256.0 + floor(d.g * 255.0 + 0.5)) / 65535.0;
+  vec2 p; float q, valid = 1.0, foot = 1.0;
+  if (genPass > 0.5) {
+    p = aPos / 8.0; q = aQ * 2.0 - 0.5; foot = aCol.a * 255.0 / 32.0;
+  } else {
+    int W = int(size.x);
+    ivec2 ip = ivec2(gl_VertexID % W, gl_VertexID / W);
+    vec4 d = texelFetch(depthTex, ip, 0);
+    p = vec2(ip);
+    q = (floor(d.r * 255.0 + 0.5) * 256.0 + floor(d.g * 255.0 + 0.5)) / 65535.0;
+    valid = d.b;
+  }
   float z = 1.0 / mix(1.0 / far, 1.0 / near, q);
   float t = 1.0 - q;          // 0 = nearest, 1 = farthest, even in inverse depth (where the detail is)
-  // Drop points on depth edges (they would float between berry and background), and in peel
-  // mode everything in front of the scan plane.
-  if (d.b < 0.5 || (scanMode > 1.5 && t < scan - 0.004)) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); return; }
+  // In peel mode drop everything in front of the scan plane.
+  if (valid < 0.5 || (scanMode > 1.5 && t < scan - 0.004)) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); return; }
 
   float zs = zpivot + (z - zpivot) * zscale;
-  vec2 ray = (vec2(p) + 0.5 - 0.5 * size) / f;
+  vec2 ray = (p + 0.5 - 0.5 * size) / f;
   vec3 P = vec3(ray.x * zs, -ray.y * zs, -zs);
-  vec2 uv = (vec2(p) + 0.5) / size;
+  vec2 uv = (p + 0.5) / size;
   // Wind: a sway in metres from the 3D spring grid, at this point's place and depth. Scaled by
   // zs / z so it projects to the same pixels whatever the Depth slider says.
   if (windOn > 0.5) P.xy += texture(windTex, vec3(uv, t)).xy * zs / z;
   gl_Position = viewProj * vec4(P, 1.0);
-  gl_PointSize = clamp(1.5 * pxScale * zs / f / gl_Position.w, 1.0, 24.0);
+  gl_PointSize = clamp(1.5 * foot * pxScale * zs / f / gl_Position.w, 1.0, 24.0);
 
-  vec3 c = colorMode > 0.5 ? turbo(0.1 + 0.85 * q) : texture(colorTex, uv).rgb;
+  vec3 c = colorMode > 0.5 ? turbo(0.1 + 0.85 * clamp(q, 0.0, 1.0)) : genPass > 0.5 ? aCol.rgb : texture(colorTex, uv).rgb;
+  t = clamp(t, 0.0, 1.0);
   c *= 1.0 - 0.35 * t;                                  // a little atmosphere: far is dimmer
   if (scanMode > 0.5) {
     // A glowing sheet sweeps from front to back; in Scan mode what is behind it waits in shadow.
@@ -99,6 +110,7 @@ function mul(a, b) {
 }
 
 function makeDepthView(canvas, colorImg, depthImg, meta, backImg) {
+  let genCount = 0, genVao = null;
   const gl = canvas.getContext('webgl2', { antialias: true, preserveDrawingBuffer: true });
   if (!gl) throw new Error('WebGL2 not available');
   const sh = (type, src) => {
@@ -132,7 +144,7 @@ function makeDepthView(canvas, colorImg, depthImg, meta, backImg) {
     [gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE], [gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE], [gl.TEXTURE_WRAP_R, gl.CLAMP_TO_EDGE]])
     gl.texParameteri(gl.TEXTURE_3D, k, v);
   const U = {};
-  for (const name of ['depthTex', 'colorTex', 'viewProj', 'size', 'f', 'near', 'far', 'zscale', 'zpivot', 'pxScale', 'scan', 'scanMode', 'colorMode', 'windOn', 'windTex'])
+  for (const name of ['depthTex', 'colorTex', 'viewProj', 'size', 'f', 'near', 'far', 'zscale', 'zpivot', 'pxScale', 'scan', 'scanMode', 'colorMode', 'windOn', 'windTex', 'genPass'])
     U[name] = gl.getUniformLocation(prog, name);
   gl.uniform1i(U.depthTex, 0); gl.uniform1i(U.colorTex, 1); gl.uniform1i(U.windTex, 2);
   gl.uniform2f(U.size, meta.w, meta.h);
@@ -145,9 +157,25 @@ function makeDepthView(canvas, colorImg, depthImg, meta, backImg) {
 
   // Orbit camera around a point at the scene's middle depth; yaw = pitch = 0, dist = pivot is
   // exactly the original camera.
+  const emptyVao = gl.createVertexArray();
   return {
     vfov,
-    draw({ yaw, pitch, dist, zoom, zscale, zpivot, scan, scanMode, colorMode, wind }) {
+    // gen.bin from tools/gen_fill.py: 12-byte records (int16 x8, int16 y8, uint16 q, rgba8, pad)
+    setGenerated(buf) {
+      genVao = gl.createVertexArray(); gl.bindVertexArray(genVao);
+      gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
+      gl.bufferData(gl.ARRAY_BUFFER, buf, gl.STATIC_DRAW);
+      const at = (name, n, type, norm, off) => {
+        const loc = gl.getAttribLocation(prog, name);
+        if (loc < 0) return;
+        gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc, n, type, norm, 12, off);
+      };
+      at('aPos', 2, gl.SHORT, false, 0); at('aQ', 1, gl.UNSIGNED_SHORT, true, 4); at('aCol', 4, gl.UNSIGNED_BYTE, true, 6);
+      gl.bindVertexArray(null);
+      genCount = buf.byteLength / 12;
+    },
+    get genCount() { return genCount; },
+    draw({ yaw, pitch, dist, zoom, zscale, zpivot, scan, scanMode, colorMode, wind, generated }) {
       const W = canvas.width, H = canvas.height;
       gl.viewport(0, 0, W, H);
       gl.clear(gl.DEPTH_BUFFER_BIT);
@@ -178,7 +206,15 @@ function makeDepthView(canvas, colorImg, depthImg, meta, backImg) {
       gl.uniform1f(U.pxScale, H / 2 / Math.tan(fovy / 2));
       gl.uniform1f(U.zscale, zscale); gl.uniform1f(U.zpivot, zpivot);
       gl.uniform1f(U.scan, scan); gl.uniform1f(U.scanMode, scanMode); gl.uniform1f(U.colorMode, colorMode);
+      gl.bindVertexArray(emptyVao);
+      gl.uniform1f(U.genPass, 0);
       gl.drawArrays(gl.POINTS, 0, meta.w * meta.h);
+      if (generated && genCount) {
+        gl.bindVertexArray(genVao);
+        gl.uniform1f(U.genPass, 1);
+        gl.drawArrays(gl.POINTS, 0, genCount);
+      }
+      gl.bindVertexArray(null);
     },
   };
 }

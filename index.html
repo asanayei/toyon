@@ -118,6 +118,7 @@
       <div class="row">
         <div class="seg" id="colors"><button data-color="0" class="on">Photo</button><button data-color="1">Depth colours</button></div>
         <div class="seg" id="scans"><button data-scan="0" class="on">No scan</button><button data-scan="1">Scan</button><button data-scan="2">Peel</button></div>
+        <div class="seg" id="gens"><button data-gen="0">Photo only</button><button data-gen="1" class="on">✨ AI fill</button></div>
         <button id="dreset">↻ Reset view</button>
         <button id="drec">⏺ Save 8 s video</button>
       </div>
@@ -133,6 +134,11 @@
     <p>Wind acts in 3D: a grid of springs ten layers deep. Gusts reach the back of the bush later and
     weaker, front twigs are springy and deep branches slow, and far things move fewer pixels by
     perspective. Each berry moves as a whole over what is behind it, so nothing stretches.</p>
+    <p>✨ AI fill: a photo only shows the front of each berry, so turning it opens gaps. An image
+    model (Stable Diffusion XL inpainting) peeled the berries off layer by layer and painted what is
+    behind them, and past the edges of the frame. Depth Pro then gave each painted pixel a depth,
+    always behind what the photo shows, adding about 400,000 points. From the front you still see
+    exactly the photo. Also precomputed, once, on a GPU.</p>
     <p>Depth by <a href="https://github.com/apple/ml-depth-pro">Depth Pro</a> (Bochkovskii et al., 2024),
     used under Apple's research licence.</p>
   </details>
@@ -372,7 +378,7 @@ document.querySelectorAll('[data-tab]').forEach(b => b.onclick = () => {
 const dcv = document.getElementById('dcv'), dstage = document.getElementById('dstage');
 const dstatus = document.getElementById('dstatus');
 const dv = { view: null, loading: false, auto: true, t0: 0, yaw: 0, pitch: 0, dist: 0, zoom: 1,
-             color: 0, scanMode: 0, scanAuto: true, wind: null, back: null, scan: 0, meta: null, drag: null, fps: 60, last: 0 };
+             color: 0, gen: 1, scanMode: 0, scanAuto: true, wind: null, back: null, scan: 0, meta: null, drag: null, fps: 60, last: 0 };
 
 async function depthStart() {
   if (dv.view || dv.loading) return;
@@ -389,6 +395,8 @@ async function depthStart() {
     dv.view = makeDepthView(dcv, color, depth, meta, bc);
     dv.wind = new DepthWind(meta);
     resetView();
+    // AI fill: generated points for what the photo never saw (tools/gen_fill.py). Optional.
+    fetch('gen.bin').then(r => r.ok ? r.arrayBuffer() : null).then(b => { if (b) dv.view.setGenerated(b); }).catch(() => {});
   } catch (err) { dstatus.textContent = 'Could not start: ' + err.message; }
   dv.loading = false;
 }
@@ -440,6 +448,7 @@ function segment(id, attr, set) {
   };
 }
 segment('colors', 'color', v => { dv.color = v; });
+segment('gens', 'gen', v => { dv.gen = v; });
 segment('scans', 'scan', v => { dv.scanMode = v; dv.scanAuto = true; });
 document.getElementById('scan').oninput = e => {
   dv.scan = e.target.value / 1000; dv.scanAuto = false;
@@ -506,11 +515,12 @@ function depthLoop(now) {
   const wv = document.getElementById('dwind').value / 100;
   dv.wind.step(Math.min(0.05, (now - dv.last) / 1000 || 1 / 60), wv);
   dv.view.draw({ yaw: dv.yaw, pitch: dv.pitch, dist: dv.dist, zoom: dv.zoom, zscale, zpivot: pivot(),
-                 scan: dv.scan, scanMode: dv.scanMode, colorMode: dv.color, wind: wv > 0 ? dv.wind : null });
+                 scan: dv.scan, scanMode: dv.scanMode, colorMode: dv.color, wind: wv > 0 ? dv.wind : null, generated: dv.gen });
   dv.fps = dv.fps * 0.95 + 0.05 * 1000 / Math.max(1, now - dv.last);
   dv.last = now;
   const m = dv.meta, z = 1 / (1 / m.near + Math.max(0, Math.min(1, dv.scan)) * (1 / m.far - 1 / m.near));
-  dstatus.textContent = `${(m.w * m.h / 1000).toFixed(0)}k points · ${Math.round(dv.fps)} fps` +
+  const gk = dv.gen ? dv.view.genCount : 0;
+  dstatus.textContent = `${(m.w * m.h / 1000).toFixed(0)}k${gk ? ` + ${(gk / 1000).toFixed(0)}k AI` : ''} points · ${Math.round(dv.fps)} fps` +
     (dv.scanMode ? ` · scan at ${z.toFixed(2)} m` : '');
 }
 requestAnimationFrame(depthLoop);
