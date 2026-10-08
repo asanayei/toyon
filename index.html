@@ -63,28 +63,13 @@
   .hint { color: var(--muted); font-size: 15px; margin: 6px 0; }
   input[type=file] { display: none; }
   .credit { font-size: 13px; } .credit a { color: var(--muted); }
-  .tabs { display: flex; gap: 6px; margin: 0 0 14px; }
-  .tabs button { border-radius: 10px 10px 0 0; }
-  [hidden] { display: none !important; }
-  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
-  .seg button { border: 0; border-radius: 0; }
-  .seg button:disabled { opacity: .4; cursor: not-allowed; }
-  #bstage { cursor: grab; } #bstage:active { cursor: grabbing; }
-  details { color: var(--muted); font-size: 15px; margin: 6px 0; }
-  summary { cursor: pointer; }
 </style>
 </head>
 <body>
 <main>
   <h1>Toyon</h1>
-  <p class="sub" id="sub">Binary topological transform, live in your browser. Nothing is uploaded.</p>
+  <p class="sub">Binary topological transform, live in your browser. Nothing is uploaded.</p>
 
-  <div class="tabs">
-    <button class="on" data-tab="topo">Topology</button>
-    <button data-tab="breeze">🍃 Breeze</button>
-  </div>
-
-  <section id="tab-topo">
   <div class="stage" id="stage">
     <canvas id="src"></canvas>
     <canvas id="fx"></canvas>
@@ -107,43 +92,9 @@
 
   <p class="hint">Click the 3×3 cells to switch them on or off. Each step, a pixel stays on only if every on-cell sees foreground. Runs until nothing changes.</p>
   <p class="hint">Drag the white line to compare. Drop an image anywhere.</p>
-  </section>
-
-  <section id="tab-breeze" hidden>
-  <div class="stage" id="bstage"><div class="tag r" id="bstatus">Loading…</div></div>
-  <div class="controls">
-    <div class="side">
-      <div class="slider"><span>Wind</span><input id="wind" type="range" min="0" max="100" value="50"></div>
-      <div class="row">
-        <span>Run on</span>
-        <div class="seg" id="engines">
-          <button data-eng="cpu" class="on">CPU</button><button data-eng="webgl">GPU · WebGL</button><button data-eng="webgpu">GPU · WebGPU</button>
-        </div>
-      </div>
-      <div class="row">
-        <button id="showfield">Show motion</button>
-        <button id="rec">⏺ Save 6 s video</button>
-        <label class="btn">📁 Your image<input id="bfile" type="file" accept="image/*"></label>
-      </div>
-    </div>
-  </div>
-  <p class="hint">Grab the branches and pull, then let go.</p>
-  <details>
-    <summary>How it works</summary>
-    <p>The photo becomes a grid of colour patches, linked strongly to neighbours of similar colour.
-    The smoothest vibration modes of that grid (eigenvectors of its graph Laplacian) are the ways the
-    plant can bend, like a drum skin cut to its shape. Each mode is a spring with its own pitch, driven
-    by turbulent wind and gusts that sweep across. Blurry areas count as far away, so they move less.
-    Every frame the modes add up to a motion field that warps the photo.</p>
-    <p>Inspired by <a href="https://generative-dynamics.github.io/">Generative Image Dynamics</a>
-    (Li et al., CVPR 2024), which predicts these modes with a diffusion model. Here they come from physics,
-    so it starts in a fraction of a second and runs live, on CPU or GPU.</p>
-  </details>
-  </section>
   <p class="hint credit">Toyon photo: <a href="https://commons.wikimedia.org/wiki/File:J20151125-0008%E2%80%94Heteromeles_arbutifolia_(23303059776).jpg">John Rusk</a>, <a href="https://creativecommons.org/licenses/by/2.0/">CC BY 2.0</a></p>
 </main>
 
-<script src="breeze.js"></script>
 <script>
 // Separable Gaussian blur on a single channel.
 function gauss(a, w, h, sigma) {
@@ -223,7 +174,7 @@ const sctx = srcCv.getContext('2d', { willReadFrequently: true }), fctx = fxCv.g
 const knob = document.getElementById('knob'), stage = document.getElementById('stage');
 const divider = document.getElementById('divider'), status = document.getElementById('status');
 const state = { frame: 0, se: [0, 1, 0, 1, 1, 1, 0, 1, 0], source: null, video: null, dirty: true };
-let run = { key: null }, tab = 'topo';
+let run = { key: null };
 
 const matrix = document.getElementById('matrix');
 function showMatrix() {
@@ -251,7 +202,6 @@ function useImage(img) {
   sctx.drawImage(img, 0, 0, srcCv.width, srcCv.height);
   state.frame++;
   state.dirty = true;
-  breezeSource(img);
 }
 
 function loadFile(file) {
@@ -334,7 +284,6 @@ function advance(w, h) {
 }
 
 function render() {
-  if (tab !== 'topo') { requestAnimationFrame(render); return; }
   const w = srcCv.width, h = srcCv.height;
   if (state.video) { sctx.drawImage(state.video, 0, 0, w, h); state.frame++; state.dirty = true; }
   if (state.dirty && w) {
@@ -358,151 +307,9 @@ function render() {
   requestAnimationFrame(render);
 }
 
-// ---------- tabs ----------
-const SUBS = {
-  topo: 'Binary topological transform, live in your browser. Nothing is uploaded.',
-  breeze: 'A still photo, set moving by physics. Runs fully in your browser, on CPU or GPU.',
-};
-document.querySelectorAll('[data-tab]').forEach(b => b.onclick = () => {
-  tab = b.dataset.tab;
-  document.querySelectorAll('[data-tab]').forEach(x => x.classList.toggle('on', x === b));
-  document.getElementById('tab-topo').hidden = tab !== 'topo';
-  document.getElementById('tab-breeze').hidden = tab !== 'breeze';
-  document.getElementById('sub').textContent = SUBS[tab];
-  if (tab === 'breeze') { stopCam(); breezeStart(); }
-  history.replaceState(null, '', tab === 'breeze' ? '#breeze' : location.pathname);
-});
-
-// ---------- breeze ----------
-const bz = { engine: 'cpu', show: false, modes: null, dyn: null, r: null, img: null, cv: null,
-             grab: null, last: 0, fps: 0, busy: false, gen: 0 };
-const bstage = document.getElementById('bstage'), bstatus = document.getElementById('bstatus');
-// Grey out WebGPU when the browser has no adapter (e.g. Chrome on Linux without the flag).
-(async () => {
-  const ok = navigator.gpu && await navigator.gpu.requestAdapter().catch(() => null);
-  if (ok) return;
-  const b = document.querySelector('[data-eng=webgpu]');
-  b.disabled = true; b.title = 'WebGPU is not available in this browser';
-})();
-
-function breezeSource(img) { bz.img = img; bz.modes = null; if (tab === 'breeze') breezeStart(); }
-
-// Analyse the image (once per image), then build the chosen renderer on a fresh canvas.
-async function breezeStart() {
-  if (!bz.img || bz.busy) return;
-  bz.busy = true;
-  const gen = ++bz.gen;
-  try {
-    if (!bz.modes) {
-      bstatus.textContent = 'Finding vibration modes…';
-      await new Promise(r => setTimeout(r, 30));
-      const t0 = performance.now(), img = bz.img;
-      const aw = 384, ah = Math.max(16, Math.round(aw * img.naturalHeight / img.naturalWidth));
-      const c = document.createElement('canvas'); c.width = aw; c.height = ah;
-      const x = c.getContext('2d', { willReadFrequently: true });
-      x.drawImage(img, 0, 0, aw, ah);
-      bz.modes = analyzeModes(x.getImageData(0, 0, aw, ah).data, aw, ah);
-      bz.modes.ms = Math.round(performance.now() - t0);
-      bz.dyn = new Dynamics(bz.modes);
-    }
-    bz.r?.destroy();
-    bz.r = null;
-    const img = bz.img, cpu = bz.engine === 'cpu';
-    const s = Math.min(1, (cpu ? 720 : 1920) / img.naturalWidth);
-    const cv = document.createElement('canvas');
-    cv.width = Math.round(img.naturalWidth * s); cv.height = Math.round(img.naturalHeight * s);
-    let r;
-    if (cpu) {
-      const ctx = cv.getContext('2d');
-      ctx.drawImage(img, 0, 0, cv.width, cv.height);
-      const src = ctx.getImageData(0, 0, cv.width, cv.height).data, out = ctx.createImageData(cv.width, cv.height);
-      r = { name: 'CPU', draw(F, show) {
-        warpCPU(src, out.data, cv.width, cv.height, F, bz.modes.gw, bz.modes.gh, show);
-        ctx.putImageData(out, 0, 0);
-      }, destroy() {} };
-    } else if (bz.engine === 'webgl') r = makeWebGL(cv, img, bz.modes.gw, bz.modes.gh);
-    else r = await makeWebGPU(cv, img, bz.modes.gw, bz.modes.gh);
-    if (gen !== bz.gen) { r.destroy(); return; }
-    bz.cv?.remove();
-    bz.cv = cv;
-    bstage.prepend(cv);
-    bz.r = r;
-  } catch (err) {
-    bstatus.textContent = 'Could not start: ' + err.message;
-    if (bz.engine !== 'cpu') { bz.engine = 'cpu'; showEngine(); bz.busy = false; return breezeStart(); }
-  } finally { bz.busy = false; }
-}
-
-function showEngine() {
-  document.querySelectorAll('[data-eng]').forEach(b => b.classList.toggle('on', b.dataset.eng === bz.engine));
-}
-document.getElementById('engines').onclick = e => {
-  const eng = e.target.dataset.eng;
-  if (!eng || e.target.disabled || eng === bz.engine) return;
-  bz.engine = eng; showEngine(); breezeStart();
-};
-document.getElementById('showfield').onclick = e => { bz.show = !bz.show; e.target.classList.toggle('on', bz.show); };
-document.getElementById('bfile').onchange = e => loadFile(e.target.files[0]);
-
-// Grab: pull the grid cell under the pointer towards where the pointer has moved.
-function cellAt(e) {
-  const r = bstage.getBoundingClientRect(), M = bz.modes;
-  const gx = Math.min(M.gw - 1, Math.max(0, Math.floor((e.clientX - r.left) / r.width * M.gw)));
-  const gy = Math.min(M.gh - 1, Math.max(0, Math.floor((e.clientY - r.top) / r.height * M.gh)));
-  return gy * M.gw + gx;
-}
-bstage.addEventListener('pointerdown', e => {
-  if (!bz.modes) return;
-  bstage.setPointerCapture(e.pointerId);
-  bz.grab = { i: cellAt(e), x0: e.clientX, y0: e.clientY, tx: 0, ty: 0 };
-});
-bstage.addEventListener('pointermove', e => {
-  if (!bz.grab) return;
-  const w = bstage.getBoundingClientRect().width, lim = 0.05;
-  let tx = (e.clientX - bz.grab.x0) / w, ty = (e.clientY - bz.grab.y0) / w;
-  const m = Math.hypot(tx, ty);
-  if (m > lim) { tx *= lim / m; ty *= lim / m; }       // pull softly past the limit
-  bz.grab.tx = tx; bz.grab.ty = ty;
-});
-const release = () => { bz.grab = null; };
-bstage.addEventListener('pointerup', release);
-bstage.addEventListener('pointercancel', release);
-
-// Record the canvas to a video file, right in the browser.
-document.getElementById('rec').onclick = e => {
-  const btn = e.target;
-  if (!bz.cv || btn.disabled) return;
-  const type = ['video/webm;codecs=vp9', 'video/webm', 'video/mp4'].find(t => MediaRecorder.isTypeSupported(t));
-  const rec = new MediaRecorder(bz.cv.captureStream(30), { mimeType: type, videoBitsPerSecond: 8e6 });
-  const chunks = [];
-  rec.ondataavailable = ev => chunks.push(ev.data);
-  rec.onstop = () => {
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(new Blob(chunks, { type }));
-    a.download = 'toyon-breeze.' + (type.includes('mp4') ? 'mp4' : 'webm');
-    a.click();
-    btn.disabled = false; btn.textContent = '⏺ Save 6 s video';
-  };
-  rec.start();
-  btn.disabled = true; btn.textContent = '● Recording…';
-  setTimeout(() => rec.stop(), 6000);
-};
-
-function breezeLoop(now) {
-  requestAnimationFrame(breezeLoop);
-  if (tab !== 'breeze' || !bz.r) { bz.last = now; return; }
-  const dt = Math.min(0.05, (now - bz.last) / 1000 || 1 / 60);
-  bz.last = now;
-  bz.dyn.step(dt, document.getElementById('wind').value / 100, bz.grab);
-  bz.r.draw(bz.dyn.computeField(), bz.show);
-  bz.fps = bz.fps * 0.95 + 0.05 / Math.max(dt, 1e-3);
-  bstatus.textContent = `${bz.r.name} · ${bz.cv.width}×${bz.cv.height} · ${Math.round(bz.fps)} fps · ${bz.modes.K} modes in ${bz.modes.ms} ms`;
-}
-requestAnimationFrame(breezeLoop);
-
 setSplit(stage.getBoundingClientRect().left + stage.getBoundingClientRect().width / 2);
 const img = new Image();
-img.onload = () => { useImage(img); if (location.hash === '#breeze') document.querySelector('[data-tab=breeze]').click(); };
+img.onload = () => useImage(img);
 img.src = 'toyon.jpg';
 requestAnimationFrame(render);
 </script>
