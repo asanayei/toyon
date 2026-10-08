@@ -113,11 +113,13 @@
   <div class="controls">
     <div class="side">
       <div class="slider"><span>Depth</span><input id="zscale" type="range" min="5" max="100" value="20"></div>
+      <div class="slider"><span>🍃 Wind</span><input id="dwind" type="range" min="0" max="100" value="50"></div>
       <div class="slider"><span>Scan</span><input id="scan" type="range" min="0" max="1000" value="0"></div>
       <div class="row">
         <div class="seg" id="colors"><button data-color="0" class="on">Photo</button><button data-color="1">Depth colours</button></div>
-        <div class="seg" id="scans"><button data-scan="0">No scan</button><button data-scan="1" class="on">Scan</button><button data-scan="2">Peel</button></div>
+        <div class="seg" id="scans"><button data-scan="0" class="on">No scan</button><button data-scan="1">Scan</button><button data-scan="2">Peel</button></div>
         <button id="dreset">↻ Reset view</button>
+        <button id="drec">⏺ Save 8 s video</button>
       </div>
     </div>
   </div>
@@ -367,7 +369,7 @@ document.querySelectorAll('[data-tab]').forEach(b => b.onclick = () => {
 const dcv = document.getElementById('dcv'), dstage = document.getElementById('dstage');
 const dstatus = document.getElementById('dstatus');
 const dv = { view: null, loading: false, auto: true, t0: 0, yaw: 0, pitch: 0, dist: 0, zoom: 1,
-             color: 0, scanMode: 1, scanAuto: true, scan: 0, meta: null, drag: null, fps: 60, last: 0 };
+             color: 0, scanMode: 0, scanAuto: true, wind: null, back: null, scan: 0, meta: null, drag: null, fps: 60, last: 0 };
 
 async function depthStart() {
   if (dv.view || dv.loading) return;
@@ -377,11 +379,45 @@ async function depthStart() {
     const [color, depth, meta] = await Promise.all([load('toyon.jpg'), load('depth.png'), fetch('depth.json').then(r => r.json())]);
     dv.meta = meta;
     sizeDepthCanvas();
-    dv.view = makeDepthView(dcv, color, depth, meta);
+    // Background to sit behind the cloud, for the slivers a moving berry uncovers. It must show
+    // what is BEHIND the berries, not the berries themselves (or each leaves a ghost imprint),
+    // so every pixel takes the colour of the farthest thing within a few berry-widths.
+    const bc = farBackdrop(color, depth);
+    dv.view = makeDepthView(dcv, color, depth, meta, bc);
+    dv.wind = new DepthWind(meta);
     resetView();
   } catch (err) { dstatus.textContent = 'Could not start: ' + err.message; }
   dv.loading = false;
 }
+function farBackdrop(color, depth) {
+  const w = 240, h = 160, r = 5;
+  const read = img => { const c = document.createElement('canvas'); c.width = w; c.height = h;
+    const x = c.getContext('2d', { willReadFrequently: true }); x.drawImage(img, 0, 0, w, h); return x.getImageData(0, 0, w, h); };
+  const col = read(color), dep = read(depth).data, out = new ImageData(w, h);
+  // Two separable passes (rows, then columns) of "keep the farthest", carrying its colour.
+  const far = new Uint8Array(w * h), rgb = new Uint8ClampedArray(w * h * 3);
+  for (let i = 0; i < w * h; i++) { far[i] = dep[4 * i]; for (let k = 0; k < 3; k++) rgb[3 * i + k] = col.data[4 * i + k]; }
+  for (const [dx, dy] of [[1, 0], [0, 1]]) {
+    const f2 = far.slice(), c2 = rgb.slice();
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      let best = 256, bi = 0;
+      for (let k = -r; k <= r; k++) {
+        const xx = Math.min(w - 1, Math.max(0, x + k * dx)), yy = Math.min(h - 1, Math.max(0, y + k * dy)), j = yy * w + xx;
+        if (far[j] < best) { best = far[j]; bi = j; }       // smaller inverse depth = farther
+      }
+      const i = y * w + x;
+      f2[i] = best; c2[3 * i] = rgb[3 * bi]; c2[3 * i + 1] = rgb[3 * bi + 1]; c2[3 * i + 2] = rgb[3 * bi + 2];
+    }
+    far.set(f2); rgb.set(c2);
+  }
+  for (let i = 0; i < w * h; i++) { for (let k = 0; k < 3; k++) out.data[4 * i + k] = rgb[3 * i + k]; out.data[4 * i + 3] = 255; }
+  const c = document.createElement('canvas'); c.width = w; c.height = h;
+  c.getContext('2d').putImageData(out, 0, 0);
+  const b = document.createElement('canvas'); b.width = w; b.height = h;
+  const bx = b.getContext('2d'); bx.filter = 'blur(3px)'; bx.drawImage(c, 0, 0);
+  return b;
+}
+
 function sizeDepthCanvas() {
   const dpr = Math.min(2, devicePixelRatio || 1), w = Math.round(dstage.clientWidth * dpr);
   if (w && dcv.width !== w) { dcv.width = w; dcv.height = Math.round(w * 2 / 3); }
@@ -425,6 +461,34 @@ dstage.addEventListener('wheel', e => {
   dv.zoom = Math.max(0.4, Math.min(6, dv.zoom * Math.exp(-e.deltaY * 0.0015)));
 }, { passive: false });
 
+// Record from the original camera: a 2D video of the breeze, with depth doing the work.
+document.getElementById('drec').onclick = e => recordDepth(e.target, 8000);
+function recordDepth(btn, ms) {
+  return new Promise(done => {
+    if (!dv.view || btn.disabled) return done(null);
+    resetView(); dv.auto = false; dv.scanMode = 0;
+    document.querySelectorAll('[data-scan]').forEach(b => b.classList.toggle('on', b.dataset.scan === '0'));
+    const type = ['video/webm;codecs=vp9', 'video/webm', 'video/mp4'].find(t => MediaRecorder.isTypeSupported(t));
+    const rec = new MediaRecorder(dcv.captureStream(30), { mimeType: type, videoBitsPerSecond: 12e6 });
+    const chunks = [];
+    rec.ondataavailable = ev => chunks.push(ev.data);
+    rec.onstop = () => {
+      const blob = new Blob(chunks, { type });
+      if (!window.KEEP_BLOB) {
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = 'toyon-depth-breeze.' + (type.includes('mp4') ? 'mp4' : 'webm');
+        a.click();
+      }
+      btn.disabled = false; btn.textContent = '⏺ Save 8 s video';
+      done(blob);
+    };
+    rec.start();
+    btn.disabled = true; btn.textContent = '● Recording…';
+    setTimeout(() => rec.stop(), ms);
+  });
+}
+
 function depthLoop(now) {
   requestAnimationFrame(depthLoop);
   if (tab !== 'depth' || !dv.view) { dv.last = now; return; }
@@ -436,8 +500,10 @@ function depthLoop(now) {
     document.getElementById('scan').value = Math.max(0, dv.scan) * 1000;
   }
   const zscale = document.getElementById('zscale').value / 100;
+  const wv = document.getElementById('dwind').value / 100;
+  dv.wind.step(Math.min(0.05, (now - dv.last) / 1000 || 1 / 60), wv);
   dv.view.draw({ yaw: dv.yaw, pitch: dv.pitch, dist: dv.dist, zoom: dv.zoom, zscale, zpivot: pivot(),
-                 scan: dv.scan, scanMode: dv.scanMode, colorMode: dv.color });
+                 scan: dv.scan, scanMode: dv.scanMode, colorMode: dv.color, wind: wv > 0 ? dv.wind : null });
   dv.fps = dv.fps * 0.95 + 0.05 * 1000 / Math.max(1, now - dv.last);
   dv.last = now;
   const m = dv.meta, z = 1 / (1 / m.near + Math.max(0, Math.min(1, dv.scan)) * (1 / m.far - 1 / m.near));
